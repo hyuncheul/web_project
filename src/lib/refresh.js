@@ -1,8 +1,22 @@
-import { LEAGUES } from "@/data/leagues";
-import { readDb, writeDbAtomic } from "./db";
+import { LEAGUES } from "../data/leagues.js";
+import { prisma } from "./prisma.js";
+import {
+  mapMatch,
+  mapScorer,
+  mapStandingRow,
+  resolveSeasonLabel,
+  splitMatches,
+} from "./transform.js";
 
 const BASE_URL = "https://api.football-data.org/v4";
 const MATCH_STATUS = "SCHEDULED,TIMED,IN_PLAY,PAUSED,FINISHED";
+
+function readToken() {
+  // 새 이름(FOOTBALL_DATA_API_TOKEN) 우선, 기존 FD_TOKEN도 호환
+  return (
+    process.env.FOOTBALL_DATA_API_TOKEN || process.env.FD_TOKEN || null
+  );
+}
 
 function formatDateInput(value) {
   if (!value) return null;
@@ -34,78 +48,92 @@ export async function refreshLeague({ league, from, to }) {
   if (!league) {
     throw new Error("league parameter is required");
   }
-  const token = process.env.FD_TOKEN;
+  const meta = LEAGUES.find((entry) => entry.code === league);
+  if (!meta) {
+    throw new Error(`unknown league: ${league}`);
+  }
+  const token = readToken();
   if (!token) {
-    throw new Error("FD_TOKEN environment variable is missing");
+    throw new Error(
+      "FOOTBALL_DATA_API_TOKEN environment variable is missing",
+    );
   }
 
   const range = normalizeRange(from, to);
-  const db = await readDb();
 
-  const mappedMatches = await fetchMatches(league, range, token);
-  const { upcomingMatches, finishedMatches } = splitMatches(mappedMatches);
+  const { matches: matchPayload, season: matchSeason } = await fetchMatches(
+    league,
+    range,
+    token,
+  );
+  const standingsPayload = await fetchStandings(league, token);
+  const scorersPayload = await fetchScorers(league, token);
 
+  const seasonLabel =
+    resolveSeasonLabel(matchPayload) ||
+    resolveSeasonLabel(standingsPayload) ||
+    resolveSeasonLabel(scorersPayload) ||
+    matchSeason;
 
-  const standingsSnapshot = await fetchStandings(league, token);
-  const scorersSnapshot = await fetchScorers(league, token);
+  await upsertLeague({
+    code: league,
+    name: meta.name,
+    season: seasonLabel,
+  });
 
-  const nowIso = new Date().toISOString();
+  const matchRows = (matchPayload.matches ?? [])
+    .map((match) => mapMatch(match, league, seasonLabel))
+    .filter(Boolean);
 
-  const updatedDb = {
-    ...db,
-    meta: {
-      ...(db.meta ?? {}),
-      updatedAt: nowIso,
-      leagues: Array.from(new Set([...(db.meta?.leagues ?? []), league]))
-    },
-    matchesUpcoming: mergeLeagueData(
-      db.matchesUpcoming,
-      upcomingMatches,
-      league,
-      (a, b) => new Date(a.utcDate) - new Date(b.utcDate),
-    ),
-    matchesFinished: mergeLeagueData(
-      db.matchesFinished,
-      finishedMatches,
-      league,
-      (a, b) => new Date(b.utcDate) - new Date(a.utcDate),
-    ),
-    standings: mergeLeagueData(
-      db.standings,
-      standingsSnapshot,
-      league,
-      (a, b) => a.position - b.position,
-    ),
-    scorers: mergeLeagueData(
-      db.scorers,
-      scorersSnapshot,
-      league,
-      (a, b) => a.rank - b.rank,
-    ),
-  };
+  const total = Array.isArray(standingsPayload.standings)
+    ? standingsPayload.standings.find((entry) => entry.type === "TOTAL")
+    : null;
+  const standingRows = total?.table
+    ? total.table
+        .map((row) => mapStandingRow(row, league, seasonLabel))
+        .filter(Boolean)
+    : [];
 
-  await writeDbAtomic(updatedDb);
+  const scorerRows = Array.isArray(scorersPayload.scorers)
+    ? scorersPayload.scorers
+        .map((entry, index) => mapScorer(entry, index, league, seasonLabel))
+        .filter(Boolean)
+    : [];
+
+  await upsertMatches(matchRows);
+  await upsertStandings(standingRows);
+  await upsertScorers(scorerRows);
+
+  const { upcomingMatches, finishedMatches } = splitMatches(matchRows);
 
   return {
     league,
+    season: seasonLabel,
     upcoming: upcomingMatches.length,
     finished: finishedMatches.length,
-    standingsUpdated: standingsSnapshot.length,
-    scorersUpdated: scorersSnapshot.length
+    standingsUpdated: standingRows.length,
+    scorersUpdated: scorerRows.length,
   };
 }
 
 export async function refreshAll(range = getSeasonRange()) {
   const results = [];
+  const failures = [];
   for (const league of LEAGUES) {
-    const result = await refreshLeague({
-      league: league.code,
-      from: range.from,
-      to: range.to,
-    });
-    results.push(result);
+    try {
+      const result = await refreshLeague({
+        league: league.code,
+        from: range.from,
+        to: range.to,
+      });
+      results.push(result);
+    } catch (error) {
+      const message = error?.message ?? String(error);
+      console.error(`[refresh] ${league.code} failed: ${message}`);
+      failures.push({ league: league.code, error: message });
+    }
   }
-  return results;
+  return { results, failures };
 }
 
 async function fetchMatches(league, range, token) {
@@ -115,160 +143,100 @@ async function fetchMatches(league, range, token) {
     dateTo: range.to,
   });
   const url = `${BASE_URL}/competitions/${league}/matches?${qs.toString()}`;
-  const data = await requestFd(url, token);
-  if (!Array.isArray(data.matches)) return [];
-  return data.matches
-    .map((match) => mapMatch(match, league))
-    .filter(Boolean);
+  const data = await requestFd(url, token, league);
+  const fallbackSeason = range.from.slice(0, 4);
+  return { matches: data, season: fallbackSeason };
 }
 
 async function fetchStandings(league, token) {
   const url = `${BASE_URL}/competitions/${league}/standings`;
-  const data = await requestFd(url, token);
-  const seasonLabel =
-    data.season?.startDate?.slice(0, 4) ??
-    data.season?.endDate?.slice(0, 4) ??
-    new Date().getUTCFullYear().toString();
-  const total = Array.isArray(data.standings)
-    ? data.standings.find((entry) => entry.type === "TOTAL")
-    : null;
-  if (!total || !Array.isArray(total.table)) {
-    return [];
-  }
-  return total.table
-    .map((row) => {
-      if (!row.team?.id) return null;
-      return {
-        leagueCode: league,
-        season: seasonLabel,
-        position: row.position,
-        teamId: row.team.id,
-        teamName: row.team.name,
-        crest: row.team.crest ?? "",
-        played: row.playedGames ?? 0,
-        won: row.won ?? 0,
-        draw: row.draw ?? 0,
-        lost: row.lost ?? 0,
-        gf: row.goalsFor ?? 0,
-        ga: row.goalsAgainst ?? 0,
-        gd: row.goalDifference ?? 0,
-        points: row.points ?? 0,
-      };
-    })
-    .filter(Boolean);
+  return requestFd(url, token, league);
 }
 
 async function fetchScorers(league, token) {
   const url = `${BASE_URL}/competitions/${league}/scorers?limit=50`;
-  const data = await requestFd(url, token);
-  const seasonLabel =
-    data.season?.startDate?.slice(0, 4) ??
-    new Date().getUTCFullYear().toString();
-  if (!Array.isArray(data.scorers)) {
-    return [];
+  return requestFd(url, token, league);
+}
+
+async function requestFd(url, token, league) {
+  let res;
+  try {
+    res = await fetch(url, {
+      headers: {
+        "X-Auth-Token": token,
+        Accept: "application/json",
+      },
+      cache: "no-store",
+    });
+  } catch (error) {
+    throw new Error(
+      `[FD ${league}] request failed for ${truncateUrl(url)}: ${error?.message ?? error}`,
+    );
   }
-  return data.scorers
-    .map((entry, index) => {
-      if (!entry.player?.id) return null;
-      return {
-        leagueCode: league,
-        season: seasonLabel,
-        rank: entry.rank ?? index + 1,
-        playerId: entry.player.id,
-        playerName: entry.player.name,
-        teamId: entry.team?.id ?? null,
-        teamName: entry.team?.name ?? "",
-        goals: entry.goals ?? 0,
-        points: entry.goals ?? 0,
-      };
-    })
-    .filter(Boolean);
-}
-
-function splitMatches(matches) {
-  const upcoming = [];
-  const finished = [];
-  matches.forEach((match) => {
-    if (match.status === "FINISHED") {
-      finished.push(match);
-    } else {
-      upcoming.push(match);
-    }
-  });
-  return { upcomingMatches: upcoming, finishedMatches: finished };
-}
-
-function mergeLeagueData(source = [], next = [], league, sorter) {
-  const filtered = (source ?? []).filter(
-    (item) => item.leagueCode !== league,
-  );
-  const combined = [...filtered, ...next];
-  return typeof sorter === "function" ? combined.sort(sorter) : combined;
-}
-
-function resolveLatestFinished(existingDate, finishedMatches) {
-  let latest = existingDate ? new Date(existingDate).getTime() : null;
-  finishedMatches.forEach((match) => {
-    if (!match?.utcDate) return;
-    const time = new Date(match.utcDate).getTime();
-    if (Number.isNaN(time)) return;
-    if (latest === null || time > latest) {
-      latest = time;
-    }
-  });
-  return latest !== null ? new Date(latest).toISOString() : existingDate ?? null;
-}
-
-async function requestFd(url, token) {
-  const res = await fetch(url, {
-    headers: {
-      "X-Auth-Token": token,
-      Accept: "application/json",
-    },
-    cache: "no-store",
-  });
   if (!res.ok) {
     const detail = await res.text();
-    throw new Error(`FD error ${res.status}: ${detail}`);
+    throw new Error(
+      `[FD ${league}] ${res.status} ${res.statusText} for ${truncateUrl(url)}: ${detail.slice(0, 200)}`,
+    );
   }
   return res.json();
 }
 
-function mapMatch(match, leagueCode) {
-  if (!match?.id) return null;
-  const home = match.homeTeam;
-  const away = match.awayTeam;
-  if (!home?.id || !away?.id) return null;
-  if (!home?.name || !away?.name) return null;
-  if (!match.utcDate || !match.status) return null;
+function truncateUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.pathname}${parsed.search}`;
+  } catch {
+    return url;
+  }
+}
 
-  const fullTime = match.score?.fullTime ?? {};
+async function upsertLeague({ code, name, season }) {
+  await prisma.league.upsert({
+    where: { code_season: { code, season } },
+    create: { code, name, season },
+    update: { name },
+  });
+}
 
-  return {
-    id: match.id,
-    leagueCode,
-    utcDate: match.utcDate,
-    status: match.status,
-    matchday: match.matchday ?? 0,
-    home: {
-      id: home.id,
-      name: home.name,
-      crest: home.crest ?? "",
-    },
-    away: {
-      id: away.id,
-      name: away.name,
-      crest: away.crest ?? "",
-    },
-    score: {
-      ftH:
-        fullTime.home === null || fullTime.home === undefined
-          ? null
-          : fullTime.home,
-      ftA:
-        fullTime.away === null || fullTime.away === undefined
-          ? null
-          : fullTime.away,
-    },
-  };
+async function upsertMatches(rows) {
+  for (const row of rows) {
+    await prisma.match.upsert({
+      where: { apiMatchId: row.apiMatchId },
+      create: row,
+      update: row,
+    });
+  }
+}
+
+async function upsertStandings(rows) {
+  for (const row of rows) {
+    await prisma.standing.upsert({
+      where: {
+        leagueCode_season_teamId: {
+          leagueCode: row.leagueCode,
+          season: row.season,
+          teamId: row.teamId,
+        },
+      },
+      create: row,
+      update: row,
+    });
+  }
+}
+
+async function upsertScorers(rows) {
+  for (const row of rows) {
+    await prisma.scorer.upsert({
+      where: {
+        leagueCode_season_playerId: {
+          leagueCode: row.leagueCode,
+          season: row.season,
+          playerId: row.playerId,
+        },
+      },
+      create: row,
+      update: row,
+    });
+  }
 }

@@ -1,0 +1,87 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model League {
+  id        Int      @id @default(autoincrement())
+  code      String
+  name      String
+  season    String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([code, season])
+  @@index([code])
+}
+
+model Match {
+  id            Int      @id @default(autoincrement())
+  apiMatchId    Int      @unique
+  leagueCode    String
+  season        String
+  utcDate       DateTime
+  status        String
+  matchday      Int?
+  homeTeamId    Int
+  homeTeamName  String
+  homeCrest     String?
+  awayTeamId    Int
+  awayTeamName  String
+  awayCrest     String?
+  fulltimeHome  Int?
+  fulltimeAway  Int?
+  lastUpdated   DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([leagueCode, status, utcDate])
+  @@index([leagueCode, season])
+}
+
+model Standing {
+  id              Int      @id @default(autoincrement())
+  leagueCode      String
+  season          String
+  position        Int
+  teamId          Int
+  teamName        String
+  crest           String?
+  played          Int      @default(0)
+  won             Int      @default(0)
+  draw            Int      @default(0)
+  lost            Int      @default(0)
+  goalsFor        Int      @default(0)
+  goalsAgainst    Int      @default(0)
+  goalDifference  Int      @default(0)
+  points          Int      @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([leagueCode, season, teamId])
+  @@index([leagueCode, season, position])
+}
+
+model Scorer {
+  id            Int      @id @default(autoincrement())
+  leagueCode    String
+  season        String
+  rank          Int
+  playerId      Int
+  playerName    String
+  teamId        Int?
+  teamName      String?
+  goals         Int      @default(0)
+  assists       Int?
+  penalties     Int?
+  playedMatches Int?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([leagueCode, season, playerId])
+  @@index([leagueCode, season, rank])
+}
